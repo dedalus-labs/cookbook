@@ -1,0 +1,42 @@
+#!/bin/bash
+# Install the runner into a memory-backed workspace. Keep its registered
+# identity on disk so a later boot can reconnect without a registration token.
+# The systemd unit invokes this script whenever the machine boots.
+set -euo pipefail
+
+REPO_URL="${repo_url}"
+RUNNER_NAME="${runner_name}"
+RUNNER_VERSION="${runner_version}"
+IDENTITY_DIR=/root/gha-runner-identity
+TOKEN="$${1:-}"
+
+export RUNNER_ALLOW_RUNASROOT=1
+
+mkdir -p /mnt/runner-tmpfs
+mountpoint -q /mnt/runner-tmpfs || mount -t tmpfs -o size=2G tmpfs /mnt/runner-tmpfs
+ln -sfn /mnt/runner-tmpfs /root/actions-runner
+cd /root/actions-runner
+
+if [ ! -f config.sh ]; then
+  curl -fsSL -o runner.tar.gz \
+    "https://github.com/actions/runner/releases/download/v$${RUNNER_VERSION}/actions-runner-linux-x64-$${RUNNER_VERSION}.tar.gz"
+  tar xzf runner.tar.gz
+  rm runner.tar.gz
+  ./bin/installdependencies.sh || true
+fi
+
+if [ -f "$IDENTITY_DIR/.runner" ]; then
+  echo "restoring persisted identity from $IDENTITY_DIR"
+  cp "$IDENTITY_DIR/.runner" "$IDENTITY_DIR/.credentials" "$IDENTITY_DIR/.credentials_rsaparams" .
+else
+  if [ -z "$TOKEN" ]; then
+    echo "no persisted identity and no registration token supplied; cannot register" >&2
+    exit 1
+  fi
+  ./config.sh --url "$REPO_URL" --token "$TOKEN" --labels dedalus --name "$RUNNER_NAME" --unattended --replace
+  mkdir -p "$IDENTITY_DIR"
+  cp .runner .credentials .credentials_rsaparams "$IDENTITY_DIR/"
+  echo "registered and persisted identity to $IDENTITY_DIR"
+fi
+
+exec ./run.sh

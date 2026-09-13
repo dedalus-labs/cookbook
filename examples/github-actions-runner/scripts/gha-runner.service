@@ -1,0 +1,13 @@
+[Unit]
+Description=GitHub Actions self-hosted runner (Dedalus Machine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/root/gha-runner-boot.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
