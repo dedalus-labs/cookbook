@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Provisions a new machine for one account and records it as that account's machine.
+# spawn-runner starts this as a transient systemd unit named after the account, so a
+# second request for the same account cannot start a second provisioning.
+#
+#   $1                   account ID
+#   CLAUDE_CLOUD_STATE   path to machines.json, account ID to machine ID
+#   DEDALUS_API_KEY      key that owns the machines
+set -euo pipefail
+: "${1:?account ID}"
+: "${CLAUDE_CLOUD_STATE:?path to machines.json}"
+: "${DEDALUS_API_KEY:?Dedalus API key}"
+
+readonly ACCOUNT=$1
+readonly REPO=/opt/claude-cloud
+
+machine=$("$REPO/provision")
+
+# spawn-runner reads the state file while this writes it. Replace it in one rename, under
+# a lock shared with other accounts' provisioning.
+exec 9>"$CLAUDE_CLOUD_STATE.lock"
+flock 9
+[ -s "$CLAUDE_CLOUD_STATE" ] || echo '{}' >"$CLAUDE_CLOUD_STATE"
+jq --arg a "$ACCOUNT" --arg m "$machine" '.[$a] = $m' "$CLAUDE_CLOUD_STATE" >"$CLAUDE_CLOUD_STATE.tmp"
+mv "$CLAUDE_CLOUD_STATE.tmp" "$CLAUDE_CLOUD_STATE"
+echo "account $ACCOUNT now uses machine $machine" >&2

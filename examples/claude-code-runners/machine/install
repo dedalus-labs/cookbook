@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Prepares a Dedalus Machine to run Claude Code runners. Safe to run again, which is
+# also how scripts and Claude Code get updated.
+# provision runs this as root through the Machines executions API.
+#
+#   stdin  base64 tarball of this repository's machine/ directory
+set -euo pipefail
+
+readonly RUNNER_USER=claude
+readonly SCRIPTS=/opt/claude-cloud
+
+# Read the bundle before anything else can consume stdin.
+bundle=$(mktemp)
+trap 'rm -f "$bundle"' EXIT
+cat >"$bundle"
+
+# Tools start-runner and the runner call. The git proxy needs git 2.32 or later. A rerun
+# skips apt when they are all present, so an update does not depend on Ubuntu's mirrors.
+if ! command -v curl git jq flock setsid >/dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl git jq util-linux >/dev/null
+fi
+
+# Sessions run as an ordinary user. Claude Code refuses some permission modes as root,
+# and a session must not be able to rewrite start-runner, which runs as root.
+id -u "$RUNNER_USER" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$RUNNER_USER"
+install -d -m 0755 -o "$RUNNER_USER" /workspace
+
+# Scripts stay root-owned and read-only to the runner's user.
+rm -rf "$SCRIPTS"
+install -d -m 0755 "$SCRIPTS"
+base64 -d "$bundle" | tar -xz -C "$SCRIPTS" --no-same-owner
+chown -R root:root "$SCRIPTS"
+chmod -R go-w "$SCRIPTS"
+
+# Native installer, per user, into ~/.local/bin.
+runuser -u "$RUNNER_USER" -- bash -c 'curl -fsSL https://claude.ai/install.sh | bash' >/dev/null
+runuser -u "$RUNNER_USER" -- /home/claude/.local/bin/claude --version

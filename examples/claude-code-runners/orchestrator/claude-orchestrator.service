@@ -1,0 +1,27 @@
+# Runs the Claude Code orchestrator, which calls spawn-runner for each queued session.
+# orchestrator/install puts this at /etc/systemd/system/claude-orchestrator.service.
+# /etc/claude-cloud/env holds DEDALUS_API_KEY and DEDALUS_BASE_URL.
+# /etc/claude-cloud/environment-secret holds the environment key from claude.ai.
+# Both are root-only (0600), and the unit waits until the key exists.
+#
+# --expected-spawn-seconds is how long a runner may take to register after a spawn
+# request, including waking its machine. A runner that misses this window cannot
+# register, and the session is offered again.
+[Unit]
+Description=Claude Code self-hosted orchestrator
+ConditionPathExists=/etc/claude-cloud/environment-secret
+
+[Service]
+EnvironmentFile=/etc/claude-cloud/env
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CLAUDE_CLOUD_STATE=/var/lib/claude-cloud/machines.json
+StateDirectory=claude-cloud
+ExecStart=/root/.local/bin/claude self-hosted-runner orchestrator \
+    --environment-secret-file /etc/claude-cloud/environment-secret \
+    --hooks-dir /opt/claude-cloud/orchestrator \
+    --expected-spawn-seconds 300
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
