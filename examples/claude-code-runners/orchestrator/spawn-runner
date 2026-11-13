@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Starts a runner for one queued Claude Code session on its owner's Dedalus Machine.
+# The orchestrator runs this once per spawn request. See the hook contract:
+# https://code.claude.com/docs/en/self-hosted-environments-configuration#the-spawn-runner-hook
+#
+# An owner without a usable machine gets a new one. That covers a person's first session
+# and a machine that can no longer serve sessions. Provisioning outlasts the hook's time
+# limit, so it runs as its own systemd unit and the session retries until the machine is
+# ready.
+#
+#   CLAUDE_RUNNER_WORK_ORDER_FILE  single-use token the new runner registers with
+#   CLAUDE_RUNNER_ORDER_ID         idempotency key, enforced on the machine
+#   CLAUDE_RUNNER_ACCOUNT_ID       session owner
+#   CLAUDE_CLOUD_STATE            path to machines.json, account ID to machine ID
+#   DEDALUS_API_KEY                key that owns the machines
+
+# Exit 1 asks Anthropic to retry. Exit 2 blocks the session until the user writes again,
+# so only a mistake no retry can fix calls `permanent`.
+set -e
+PERMANENT=
+permanent() { printf '%s\n' "$*" >&2; PERMANENT=1; exit 2; }
+# shellcheck disable=SC2154 # rc is assigned inside the trap string
+trap 'rc=$?; [ "$rc" -eq 0 ] || [ -n "${PERMANENT:-}" ] || exit 1' EXIT
+set -uo pipefail
+
+: "${CLAUDE_RUNNER_WORK_ORDER_FILE:?set by the orchestrator}"
+: "${CLAUDE_RUNNER_ORDER_ID:?set by the orchestrator}"
+: "${CLAUDE_CLOUD_STATE:?path to machines.json}"
+: "${DEDALUS_API_KEY:?Dedalus API key}"
+
+# The hook must return within --hook-timeout (60s by default). Wait less than that for
+# the machine to confirm the runner started.
+readonly START_DEADLINE_S=45
+
+# A file named after a machine ID here holds that machine. Its contents say why.
+readonly HOLDS=/var/lib/claude-cloud/holds
+
+# Per machine, <id>.failures counts runner starts that failed in a row, and <id>.restarted
+# records when spawn-runner slept the machine so the next start wakes it fresh. A machine
+# that keeps failing after that, or is not back within REPLACE_AFTER_S, is replaced. The
+# old machine is kept.
+readonly RECOVERY=/var/lib/claude-cloud/recovery
+readonly FAILURES_BEFORE_SLEEP=3
+readonly REPLACE_AFTER_S=1800
+
+# Returns success when the account has no machine that can serve it again: none recorded,
+# destroyed, failed with the API saying a retry will not help, or still failing after a
+# fresh wake. A machine that is failed but retryable, or that cannot be read right now,
+# is retried instead.
+needs_new_machine() {
+    local reply errors failures restarted failed_for
+    [ -n "$machine" ] || return 0
+
+    # A hold keeps every automated action off a machine, replacement included, for
+    # example while you work on it by hand. Remove the file to release it.
+    if [ -e "$HOLDS/$machine" ]; then
+        echo "machine $machine is on hold: $(cat "$HOLDS/$machine")" >&2
+        exit 1
+    fi
+
+    failures=$(cat "$RECOVERY/$machine.failures" 2>/dev/null || echo 0)
+    restarted=$(cat "$RECOVERY/$machine.restarted" 2>/dev/null || true)
+    if [ -n "$restarted" ] && [ "$failures" -ge "$FAILURES_BEFORE_SLEEP" ]; then
+        echo "runner starts on machine $machine still fail after a fresh wake, replacing it" >&2
+        return 0
+    fi
+
+    # The CLI prints the machine on stdout, or on failure an error on stderr whose body
+    # carries the API's error_code. Keep whichever one came back.
+    errors=$(mktemp)
+    reply=$(dedalus machines retrieve --machine-id "$machine" --format json 2>"$errors") ||
+        reply=$(cat "$errors")
+    rm -f "$errors"
+
+    # A machine has a status object. An API error has a body with an error_code. Anything
+    # else, such as a network error, cannot be read right now.
+    case "$(jq -r 'if (.body | type) == "object" then (.body.error_code // "unknown")
+        elif (.status | type) == "object" then "ok" else "unreadable" end' <<<"$reply" 2>/dev/null)" in
+        ok) ;;
+        RESOURCE_NOT_FOUND) return 0 ;;
+        *)
+            echo "cannot read machine $machine: $reply" >&2
+            exit 1
+            ;;
+    esac
+    machine_phase=$(jq -r '.status.phase' <<<"$reply")
+    case "$(jq -r '.status.phase + ":" + (.status.retryable | tostring)' <<<"$reply")" in
+        destroying:* | destroyed:* | failed:false) return 0 ;;
+        running:* | sleeping:*) ;;
+        failed:true)
+            # A retryable machine gets REPLACE_AFTER_S to recover before its owner gets a
+            # new one.
+            failed_for=$(jq -r '(now - (.status.last_transition_at | sub("\\.[0-9]+"; "") | fromdateiso8601)) | floor' <<<"$reply")
+            if [ "$failed_for" -ge "$REPLACE_AFTER_S" ]; then
+                echo "machine $machine has been failed ($(jq -r .status.reason <<<"$reply")) for ${failed_for}s, replacing it" >&2
+                return 0
+            fi
+            echo "machine $machine failed ${failed_for}s ago and may recover, retrying later" >&2
+            exit 1
+            ;;
+        *)
+            # A machine slept by spawn-runner that has not settled within REPLACE_AFTER_S.
+            if [ -n "$restarted" ] && [ $(($(date +%s) - restarted)) -ge "$REPLACE_AFTER_S" ]; then
+                echo "machine $machine is still $machine_phase ${REPLACE_AFTER_S}s after it was slept, replacing it" >&2
+                return 0
+            fi
+            # Between states, such as stopping or starting. Leave it alone and retry later.
+            echo "machine $machine is $machine_phase ($(jq -r .status.reason <<<"$reply")), retrying later" >&2
+            exit 1
+            ;;
+    esac
+    return 1
+}
+
+# Counts a runner start that failed before start-runner ran, then exits to retry. Enough
+# failures in a row sleep the machine once, so the next start wakes it fresh.
+start_failure() {
+    local failures
+    echo "starting a runner on machine $machine failed: $*" >&2
+    install -d -m 0755 "$RECOVERY"
+    failures=$(($(cat "$RECOVERY/$machine.failures" 2>/dev/null || echo 0) + 1))
+    echo "$failures" >"$RECOVERY/$machine.failures"
+    if [ "$failures" -ge "$FAILURES_BEFORE_SLEEP" ] && [ ! -e "$RECOVERY/$machine.restarted" ]; then
+        echo "sleeping machine $machine after $failures failed starts, the next start wakes it" >&2
+        dedalus machines sleep --machine-id "$machine" >/dev/null 2>&1 || true
+        date +%s >"$RECOVERY/$machine.restarted"
+        echo 0 >"$RECOVERY/$machine.failures"
+    fi
+    exit 1
+}
+
+# Every person in the claude.ai organization gets a machine: only members can send
+# sessions to the environment. Sessions without an account, such as Claude Tag channel
+# sessions, have no owner to give a machine to.
+account=${CLAUDE_RUNNER_ACCOUNT_ID:-}
+[ -n "$account" ] || permanent "This environment only serves sessions started by a person."
+machine=$(jq -r --arg a "$account" '.[$a] // empty' "$CLAUDE_CLOUD_STATE" 2>/dev/null || true)
+
+# Provision once per account at a time: the unit name is the lock. The old machine, if
+# any, stays recorded until the new one replaces it.
+if needs_new_machine; then
+    if [ -n "$machine" ]; then rm -f "$RECOVERY/$machine".*; fi
+    unit=claude-provision-$(systemd-escape "$account")
+    if ! systemctl is-active --quiet "$unit"; then
+        echo "provisioning a machine for account $account (was: ${machine:-none})" >&2
+        systemd-run --quiet --collect --unit "$unit" \
+            --property EnvironmentFile=/etc/claude-cloud/env \
+            --setenv CLAUDE_CLOUD_STATE="$CLAUDE_CLOUD_STATE" \
+            --setenv PATH="$PATH" \
+            /opt/claude-cloud/orchestrator/provision-for "$account" || true
+    fi
+    echo "Creating your Dedalus Machine. The session starts on its own once it is ready." >&2
+    exit 1
+fi
+
+# Start the runner on the machine. The execution wakes a sleeping machine on its own.
+# The work order travels on stdin, which the API never returns, unlike command and env.
+if ! execution=$(dedalus machines executions create \
+    --machine-id "$machine" \
+    --env "$(jq -cn --arg order "$CLAUDE_RUNNER_ORDER_ID" --arg session "${CLAUDE_RUNNER_SESSION_UUID:-}" \
+        '{ORDER_ID: $order, SESSION_UUID: $session}')" \
+    --stdin "$(cat "$CLAUDE_RUNNER_WORK_ORDER_FILE")" \
+    --command '["/opt/claude-cloud/start-runner"]' \
+    --transform execution_id --raw-output); then
+    # The CLI already wrote the API's error to stderr.
+    start_failure "creating the execution failed"
+fi
+
+# Report a runner that failed to start, so the session retries instead of waiting out
+# the whole spawn lease. Still running at the deadline is not a failure: the lease covers
+# it. An execution the API ended carries an error_code. One start-runner ended has an
+# exit code.
+deadline=$((SECONDS + START_DEADLINE_S))
+while [ "$SECONDS" -lt "$deadline" ]; do
+    reply=$(dedalus machines executions retrieve --machine-id "$machine" --execution-id "$execution")
+    status=$(jq -r .status <<<"$reply")
+    case "$status" in
+        succeeded)
+            rm -f "$RECOVERY/$machine".*
+            exit 0
+            ;;
+        failed | cancelled | expired)
+            error_code=$(jq -r '.error_code // empty' <<<"$reply")
+            if [ -n "$error_code" ]; then
+                start_failure "$error_code: $(jq -r '.error_message // ""' <<<"$reply")"
+            fi
+            dedalus machines executions output --machine-id "$machine" --execution-id "$execution" \
+                --transform stderr --raw-output >&2 || true
+            echo "start-runner $status on machine $machine" >&2
+            exit 1
+            ;;
+    esac
+    sleep 1
+done
+echo "start-runner still running on machine $machine after ${START_DEADLINE_S}s" >&2

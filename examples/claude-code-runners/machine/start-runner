@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Starts one session-bound Claude Code runner on this machine and returns.
+# spawn-runner runs this as root through the Machines executions API.
+#
+#   stdin         the single-use work order the runner registers with
+#   ORDER_ID      the spawn request it answers. A redelivered request starts nothing.
+#   SESSION_UUID  the session the work order is bound to. A resumed session gets its old
+#                 slot back when that slot is free.
+set -euo pipefail
+: "${ORDER_ID:?set by spawn-runner}"
+SESSION_UUID=${SESSION_UUID:-}
+
+readonly RUNNER_USER=claude
+readonly CLAUDE_BIN=/home/claude/.local/bin/claude
+
+# Oldest Claude Code a runner may start with. A runner runs the binary on this machine's
+# disk, so an older binary is updated before the runner starts. Raise this when Anthropic
+# announces a security release.
+readonly MIN_CLAUDE_VERSION=2.1.308
+readonly ORDERS=/var/lib/claude-cloud/orders
+readonly LOGS=/var/log/claude-cloud
+readonly SLOTS=/var/lib/claude-cloud/slots
+
+# The runner clones each repository to <base-dir>/<owner>/<repo>, with nothing per
+# session in the path. Two runners with one base dir would share a working tree, so each
+# runner takes a slot with its own base dir. A slot's clones stay warm between sessions.
+# The count bounds one person's concurrent sessions and the disk their clones use.
+readonly SLOT_COUNT=4
+
+# Each flag below has a reason:
+#   --capacity 1                a work order binds exactly one session, and the git proxy
+#                               refuses a higher capacity
+#   --use-anthropic-git-proxy   git reaches GitHub through Claude's GitHub connection, so no
+#                               machine holds a GitHub credential
+#   --push-outcome-on-release   a released session's commits reach GitHub before the next
+#                               session in its slot resets the clone
+#   --health-port 0             several runners share this machine
+#   --release-idle-session-min  an idle session frees the runner, the runner exits, the machine sleeps
+#   --remove-session-state      per-session config and transcripts would otherwise fill the disk
+readonly RUNNER_FLAGS=(
+    --capacity 1
+    --use-anthropic-git-proxy
+    --push-outcome-on-release
+    --health-port 0
+    --release-idle-session-min 30
+    --remove-session-state
+)
+
+order_file=$ORDERS/$ORDER_ID.jwt
+log_file=$LOGS/$ORDER_ID.log
+
+# Answer each spawn request at most once.
+install -d -m 0700 -o "$RUNNER_USER" "$ORDERS"
+install -d -m 0700 -o "$RUNNER_USER" "$LOGS"
+if [ -e "$order_file" ]; then
+    echo "order $ORDER_ID already started" >&2
+    exit 0
+fi
+(umask 077 && cat >"$order_file")
+chown "$RUNNER_USER" "$order_file"
+
+# Update Claude Code first when it is older than the minimum. sort -V orders versions.
+# The installer links $CLAUDE_BIN to versions/<version>, so the link names the version
+# without running the binary.
+current=$(basename "$(readlink -f "$CLAUDE_BIN" 2>/dev/null)")
+[[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || current=
+if [ "$(printf '%s\n%s\n' "$MIN_CLAUDE_VERSION" "${current:-0}" | sort -V | head -1)" != "$MIN_CLAUDE_VERSION" ]; then
+    echo "Claude Code ${current:-missing} is older than $MIN_CLAUDE_VERSION, updating" >>"$log_file"
+    runuser -u "$RUNNER_USER" -- env HOME=/home/claude bash -c 'curl -fsSL https://claude.ai/install.sh | bash' \
+        >>"$log_file" 2>&1 </dev/null
+fi
+
+# Returns success after locking slot $1 on a descriptor the runner inherits. The lock
+# lasts exactly as long as the runner and its children hold that descriptor, so a slot
+# frees itself however the runner ends.
+claim_slot() {
+    local fd
+    exec {fd}>"$SLOTS/$1.lock"
+    if flock -n "$fd"; then
+        slot=$1
+        return 0
+    fi
+    exec {fd}>&-
+    return 1
+}
+
+# Prefer the slot this session used before, so a resumed session keeps its paths. Any
+# free slot works otherwise. With every slot busy, the session retries later.
+install -d -m 0755 "$SLOTS"
+slot=
+previous=
+if [ -n "$SESSION_UUID" ]; then previous=$(cat "$SLOTS/session-$SESSION_UUID" 2>/dev/null || true); fi
+for candidate in $previous $(seq 0 $((SLOT_COUNT - 1))); do
+    if claim_slot "$candidate"; then break; fi
+done
+if [ -z "$slot" ]; then
+    rm -f "$order_file"
+    echo "all $SLOT_COUNT runner slots on this machine are busy" >&2
+    exit 1
+fi
+if [ -n "$SESSION_UUID" ]; then echo "$slot" >"$SLOTS/session-$SESSION_UUID"; fi
+base_dir=/workspace/slot-$slot
+install -d -m 0755 -o "$RUNNER_USER" "$base_dir"
+echo "order $ORDER_ID uses slot $slot" >>"$log_file"
+
+# Detach the runner so it keeps running after this execution returns. Redirecting stdin,
+# stdout and stderr lets the execution finish. The work order is deleted once the runner
+# exits.
+# shellcheck disable=SC2016 # expanded by the inner bash, from its arguments
+setsid runuser -u "$RUNNER_USER" -- env HOME=/home/claude USER=claude LOGNAME=claude bash -c 'order=$1; shift; "$@"; rm -f "$order"' \
+    bash "$order_file" "$CLAUDE_BIN" self-hosted-runner --environment-secret-file "$order_file" \
+    --base-dir "$base_dir" "${RUNNER_FLAGS[@]}" \
+    </dev/null >>"$log_file" 2>&1 &
+runner=$!
+
+# A process started by an execution counts as activity, so the runner keeps the machine
+# awake until it exits. Give it a moment, then check that it survived startup.
+sleep 3
+if ! kill -0 "$runner" 2>/dev/null; then
+    tail -n 20 "$log_file" >&2
+    echo "runner for order $ORDER_ID exited during startup" >&2
+    exit 1
+fi

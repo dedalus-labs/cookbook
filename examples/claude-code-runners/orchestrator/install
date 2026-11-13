@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Prepares the orchestrator machine: tools, this repository at /opt/claude-cloud, and the
+# systemd unit. Safe to run again, which is also how scripts get updated.
+# provision runs this as root through the Machines executions API. Secrets are written
+# separately, see README.md. The unit starts once the environment key exists.
+#
+#   stdin  base64 tarball of this repository
+set -euo pipefail
+
+readonly REPO=/opt/claude-cloud
+readonly UNIT=claude-orchestrator.service
+
+# Read the bundle before anything else can consume stdin.
+bundle=$(mktemp)
+trap 'rm -f "$bundle"' EXIT
+cat >"$bundle"
+
+# Tools the orchestrator and its hooks call. Both installers put their binary in
+# /root/.local/bin, which the unit adds to PATH.
+# A rerun skips apt when they are all present, so an update does not depend on Ubuntu's
+# mirrors.
+if ! command -v curl jq flock systemd-escape >/dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq ca-certificates curl jq util-linux >/dev/null
+fi
+curl -fsSL https://claude.ai/install.sh | bash >/dev/null
+# The hooks parse the CLI's output and error format, so pin the release they were written
+# against instead of taking whatever the installer serves.
+cli=$(mktemp -d)
+curl -fsSL --retry 5 --retry-all-errors -o "$cli/cli.tgz" \
+    https://github.com/dedalus-labs/dedalus-cli/releases/download/v0.8.0/dedalus-linux-x64.tar.gz
+echo "59b5ae3dd1f46e90e166ce97c52b95bc9f087ca9f602842caa0f567456d59e56  $cli/cli.tgz" | sha256sum -c --quiet
+tar -xzf "$cli/cli.tgz" -C "$cli" dedalus
+install -D -m 0755 "$cli/dedalus" /root/.local/bin/dedalus
+rm -rf "$cli"
+
+# Root-owned and read-only to everyone else, because the hooks run as root.
+rm -rf "$REPO"
+install -d -m 0755 "$REPO"
+base64 -d "$bundle" | tar -xz -C "$REPO" --no-same-owner
+chown -R root:root "$REPO"
+chmod -R go-w "$REPO"
+install -d -m 0700 /etc/claude-cloud
+
+# Pick up a changed unit or scripts. A running orchestrator restarts, and one still
+# waiting for its environment key stays stopped.
+install -m 0644 "$REPO/orchestrator/$UNIT" "/etc/systemd/system/$UNIT"
+systemctl daemon-reload
+systemctl enable --quiet "$UNIT"
+systemctl try-restart "$UNIT"
+/root/.local/bin/claude --version
+/root/.local/bin/dedalus --version

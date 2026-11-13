@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Creates a Dedalus Machine, or updates an existing one, and installs what its role needs.
+# Prints only the machine ID on stdout. orchestrator/provision-for runs this for new and
+# replaced personal machines. Run it by hand for the orchestrator machine, or to update an
+# existing machine's scripts and Claude Code.
+#
+#   provision [<machine-id>]               a personal machine that runs runners
+#   provision orchestrator [<machine-id>]  the orchestrator machine
+#
+#   DEDALUS_API_KEY   key that owns the machines
+#   DEDALUS_BASE_URL  optional, defaults to https://dcs.dedaluslabs.ai
+set -euo pipefail
+: "${DEDALUS_API_KEY:?Dedalus API key}"
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+readonly HERE
+
+# Install output can run long. Wait for it rather than return early.
+readonly INSTALL_TIMEOUT_S=900
+
+# Each role ships a directory and runs an installer from it.
+#   personal      4 vCPU, 16 GiB and 50 GiB. Needs the Pro tier: Hobby caps storage at
+#                 10 GiB. Autosleep starts counting once the last runner exits.
+#   orchestrator  1 vCPU, 1 GiB and 10 GiB, with autosleep off so it is always there to
+#                 answer spawn requests.
+if [ "${1:-}" = orchestrator ]; then
+    shift
+    machine_flags=(--vcpu 1 --memory-mib 1024 --storage-gib 10 --autosleep never)
+    bundle_dir=$HERE
+    installer=$HERE/orchestrator/install
+else
+    machine_flags=(--vcpu 4 --memory-mib 16384 --storage-gib 50 --autosleep 10m)
+    bundle_dir=$HERE/machine
+    installer=$HERE/machine/install
+fi
+
+# A machine this run created holds nothing yet. If its install fails, destroy it so it
+# neither counts against the machine cap nor gets recorded for anyone.
+created=
+destroy_created() {
+    [ -n "$created" ] || return 0
+    echo "destroying machine $created after a failed install" >&2
+    dedalus machines delete --machine-id "$created" >/dev/null || true
+}
+# shellcheck disable=SC2154 # rc is assigned inside the trap string
+trap 'rc=$?; [ "$rc" -eq 0 ] || destroy_created' EXIT
+
+machine=${1:-}
+if [ -z "$machine" ]; then
+    # The CLI writes an API error to stderr, so the log already says why.
+    if ! machine=$(dedalus machines create "${machine_flags[@]}" --transform machine_id --raw-output); then
+        echo "machine create failed" >&2
+        exit 1
+    fi
+    created=$machine
+    echo "created machine $machine" >&2
+fi
+
+# Ship the role's directory to the machine on stdin and run its installer there.
+# COPYFILE_DISABLE keeps macOS tar from adding ._* metadata files.
+bundle=$(COPYFILE_DISABLE=1 tar -C "$bundle_dir" --exclude .git -cz . | base64)
+execution=$(dedalus machines executions create \
+    --machine-id "$machine" \
+    --stdin "$bundle" \
+    --timeout-ms $((INSTALL_TIMEOUT_S * 1000)) \
+    --command "$(jq -cn --rawfile script "$installer" '["bash", "-c", $script]')" \
+    --transform execution_id --raw-output)
+
+# Report the installer's result. A poll that errors is retried rather than taken as a
+# failed install, which would destroy a new machine.
+while :; do
+    reply=$(dedalus machines executions retrieve --machine-id "$machine" --execution-id "$execution") || {
+        sleep 3
+        continue
+    }
+    status=$(jq -r .status <<<"$reply")
+    case "$status" in
+        succeeded | failed | cancelled | expired) break ;;
+    esac
+    sleep 3
+done
+dedalus machines executions output --machine-id "$machine" --execution-id "$execution" --format pretty >&2 || true
+if [ "$status" != succeeded ]; then
+    echo "install $status on machine $machine: $(jq -c '{exit_code, error_code, error_message}' <<<"$reply")" >&2
+    exit 1
+fi
+echo "$machine"
